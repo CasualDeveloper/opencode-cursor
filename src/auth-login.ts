@@ -1,26 +1,19 @@
-/**
- * Headless Cursor browser OAuth for hosts (e.g. OpenChamber) that do not
- * surface plugin `auth.methods` on the provider detail page.
- *
- * Starts the same PKCE login as `opencode auth login`, logs the browser URL,
- * polls in the background, and writes tokens to OpenCode's auth.json.
- */
+/** Cursor browser OAuth polling used by the OpenCode V2 integration. */
 import {
   generateCursorAuthParams,
   getTokenExpiry,
   tryPollCursorAuth,
 } from "./auth.js";
-import { writeStoredCursorAuth } from "./auth/opencode-auth-store.js";
 import { clearModelCache } from "./models.js";
 import { log } from "./shared/log.js";
 
 export type PendingCursorLogin = {
   url: string;
   uuid: string;
-  /** PKCE verifier — needed if the official OAuth callback shares this session. */
   verifier: string;
   startedAt: number;
   completed: boolean;
+  result: Promise<CursorBrowserLoginResult>;
 };
 
 export type CursorBrowserLoginResult = {
@@ -29,160 +22,161 @@ export type CursorBrowserLoginResult = {
   expires: number;
 };
 
-const POLL_INTERVAL_MS = 2000;
-const POLL_MAX_MS = 15 * 60 * 1000;
+type CursorLoginSession = PendingCursorLogin & {
+  timer: ReturnType<typeof setTimeout> | undefined;
+  resolve: (value: CursorBrowserLoginResult) => void;
+  reject: (reason: Error) => void;
+};
 
-let pending: PendingCursorLogin | null = null;
-let pollTimer: ReturnType<typeof setTimeout> | null = null;
-let pollResolve: ((value: CursorBrowserLoginResult) => void) | null = null;
-let pollReject: ((reason?: unknown) => void) | null = null;
-let pollInFlight: Promise<CursorBrowserLoginResult> | null = null;
+const POLL_INTERVAL_MS = 2_000;
+const POLL_MAX_MS = 15 * 60 * 1_000;
 
-function writeCursorAuth(accessToken: string, refreshToken: string): number {
-  const expires = getTokenExpiry(accessToken);
-  writeStoredCursorAuth({
-    type: "oauth",
-    access: accessToken,
-    refresh: refreshToken,
-    expires,
-  });
-  return expires;
+let current: CursorLoginSession | undefined;
+let startInFlight: Promise<CursorLoginSession> | undefined;
+let generation = 0;
+
+function clearTimer(session: CursorLoginSession): void {
+  if (!session.timer) return;
+  clearTimeout(session.timer);
+  session.timer = undefined;
 }
 
-function clearPollTimer(): void {
-  if (pollTimer) {
-    clearTimeout(pollTimer);
-    pollTimer = null;
-  }
+function failSession(
+  session: CursorLoginSession,
+  error: Error,
+): void {
+  if (current !== session || session.completed) return;
+  clearTimer(session);
+  session.completed = true;
+  session.reject(error);
 }
 
-function failPending(error: Error): void {
-  clearPollTimer();
-  pollReject?.(error);
-  pollResolve = null;
-  pollReject = null;
+function completeSession(
+  session: CursorLoginSession,
+  result: CursorBrowserLoginResult,
+): void {
+  if (current !== session || session.completed) return;
+  clearTimer(session);
+  session.completed = true;
+  session.resolve(result);
 }
 
-function completePending(result: CursorBrowserLoginResult): void {
-  clearPollTimer();
-  if (pending) {
-    pending.completed = true;
-  }
-  pollResolve?.(result);
-  pollResolve = null;
-  pollReject = null;
-}
-
-function schedulePoll(delayMs: number): void {
-  clearPollTimer();
-  if (!pending || pending.completed) return;
-  pollTimer = setTimeout(() => {
-    void runPollTick();
+function schedulePoll(
+  session: CursorLoginSession,
+  delayMs: number,
+): void {
+  clearTimer(session);
+  if (current !== session || session.completed) return;
+  session.timer = setTimeout(() => {
+    void runPollTick(session);
   }, delayMs);
 }
 
-async function runPollTick(): Promise<void> {
-  if (!pending || pending.completed) return;
+async function runPollTick(session: CursorLoginSession): Promise<void> {
+  if (current !== session || session.completed) return;
 
-  if (Date.now() - pending.startedAt > POLL_MAX_MS) {
+  if (Date.now() - session.startedAt > POLL_MAX_MS) {
     const error = new Error("Cursor authentication polling timeout");
     log.error(`[opencode-cursor] Browser login failed: ${error.message}`);
-    failPending(error);
+    failSession(session, error);
     return;
   }
 
   try {
-    const tokens = await tryPollCursorAuth(pending.uuid, pending.verifier);
+    const tokens = await tryPollCursorAuth(
+      session.uuid,
+      session.verifier,
+    );
     if (!tokens) {
-      schedulePoll(POLL_INTERVAL_MS);
+      schedulePoll(session, POLL_INTERVAL_MS);
       return;
     }
 
-    const expires = writeCursorAuth(tokens.accessToken, tokens.refreshToken);
     clearModelCache();
-    log.info(
-      "[opencode-cursor] Browser login complete — reload OpenChamber / OpenCode to load Cursor models",
-    );
-    completePending({
+    log.info("[opencode-cursor] Browser login complete");
+    completeSession(session, {
       access: tokens.accessToken,
       refresh: tokens.refreshToken,
-      expires,
+      expires: getTokenExpiry(tokens.accessToken),
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message =
+      error instanceof Error ? error.message : String(error);
     if (/fetch|network|timeout|ECONN|ENOTFOUND|429|5\d\d/i.test(message)) {
-      schedulePoll(POLL_INTERVAL_MS + 1000);
+      schedulePoll(session, POLL_INTERVAL_MS + 1_000);
       return;
     }
     log.error(`[opencode-cursor] Browser login failed: ${message}`);
-    failPending(error instanceof Error ? error : new Error(message));
+    failSession(
+      session,
+      error instanceof Error ? error : new Error(message),
+    );
   }
 }
 
-/**
- * Start (or return) a Cursor browser OAuth login and begin background polling.
- * Safe to call repeatedly from the config hook while logged out.
- */
 export async function startCursorBrowserLogin(): Promise<PendingCursorLogin> {
   if (
-    pending &&
-    !pending.completed &&
-    Date.now() - pending.startedAt < POLL_MAX_MS
+    current &&
+    !current.completed &&
+    Date.now() - current.startedAt < POLL_MAX_MS
   ) {
-    return pending;
+    return current;
   }
+  if (startInFlight) return startInFlight;
 
   resetPendingCursorLogin();
-
-  const { verifier, uuid, loginUrl } = await generateCursorAuthParams();
-
-  pending = {
-    url: loginUrl,
-    uuid,
-    verifier,
-    startedAt: Date.now(),
-    completed: false,
-  };
-
-  pollInFlight = new Promise<CursorBrowserLoginResult>((resolve, reject) => {
-    pollResolve = resolve;
-    pollReject = reject;
-  });
-  void pollInFlight.catch(() => {});
-
-  console.log(
-    "\n[opencode-cursor] Open this URL in your browser to authorize Cursor:\n",
-  );
-  console.log(`  ${loginUrl}\n`);
-  console.log("[opencode-cursor] Waiting for authorization…\n");
-  log.info(`[opencode-cursor] Cursor login URL: ${loginUrl}`);
-
-  schedulePoll(500);
-  return pending;
-}
-
-/** Await the in-flight browser login poll (shared with authorize callback). */
-export async function waitForCursorBrowserLogin(): Promise<CursorBrowserLoginResult> {
-  if (!pollInFlight) {
-    await startCursorBrowserLogin();
+  const expectedGeneration = generation;
+  const attempt = (async () => {
+    const { verifier, uuid, loginUrl } =
+      await generateCursorAuthParams();
+    if (expectedGeneration !== generation) {
+      throw new Error("Cursor browser login cancelled");
+    }
+    let resolve!: (value: CursorBrowserLoginResult) => void;
+    let reject!: (reason: Error) => void;
+    const result = new Promise<CursorBrowserLoginResult>(
+      (resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+      },
+    );
+    const session: CursorLoginSession = {
+      url: loginUrl,
+      uuid,
+      verifier,
+      startedAt: Date.now(),
+      completed: false,
+      timer: undefined,
+      result,
+      resolve,
+      reject,
+    };
+    result.catch(() => {});
+    current = session;
+    log.info(`[opencode-cursor] Cursor login URL: ${loginUrl}`);
+    schedulePoll(session, 500);
+    return session;
+  })();
+  startInFlight = attempt;
+  try {
+    return await attempt;
+  } finally {
+    if (startInFlight === attempt) startInFlight = undefined;
   }
-  if (!pollInFlight) {
-    throw new Error("Cursor browser login is not in progress");
-  }
-  return pollInFlight;
 }
 
 export function getPendingCursorLogin(): PendingCursorLogin | null {
-  return pending;
+  return current ?? null;
 }
 
 export function resetPendingCursorLogin(): void {
-  clearPollTimer();
-  if (pollReject) {
-    pollReject(new Error("Cursor browser login cancelled"));
-  }
-  pending = null;
-  pollInFlight = null;
-  pollResolve = null;
-  pollReject = null;
+  generation += 1;
+  startInFlight = undefined;
+  const session = current;
+  current = undefined;
+  if (!session) return;
+  clearTimer(session);
+  if (session.completed) return;
+  session.completed = true;
+  session.reject(new Error("Cursor browser login cancelled"));
 }

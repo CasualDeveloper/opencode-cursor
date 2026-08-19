@@ -9,9 +9,12 @@
  * across requests: after a stream completes, the worker returns to
  * the idle pool. Dead workers are replaced automatically.
  */
-import { resolve as pathResolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { resolveNodeExecutable } from "./node-runtime.js";
 
-const PERSISTENT_BRIDGE_PATH = pathResolve(import.meta.dir, "h2-bridge-persistent.mjs");
+const PERSISTENT_BRIDGE_PATH = fileURLToPath(
+  new URL("./h2-bridge-persistent.mjs", import.meta.url),
+);
 
 // --- Typed message protocol constants ---
 const IN_NEW_REQUEST = 0x00;
@@ -49,7 +52,7 @@ interface PersistentWorker {
 }
 
 function spawnWorker(): PersistentWorker {
-  const proc = Bun.spawn(["node", PERSISTENT_BRIDGE_PATH], {
+  const proc = Bun.spawn([resolveNodeExecutable(), PERSISTENT_BRIDGE_PATH], {
     stdin: "pipe",
     stdout: "pipe",
     stderr: "ignore",
@@ -212,10 +215,9 @@ export class BridgePool {
     if (!worker) {
       if (this.allWorkers.size < this.maxSize) {
         worker = this.addWorker();
+        this.idle.pop();
       } else {
-        // Pool full — spawn an ephemeral worker not tracked by pool
-        worker = spawnWorker();
-        // Don't add to allWorkers — it won't be returned to pool
+        throw new Error(`BridgePool capacity reached (${this.maxSize} active workers)`);
       }
     }
 
@@ -301,7 +303,6 @@ export class BridgePool {
     /** Exit code recorded when STREAM_DONE/process-death completes before callers attach onClose. */
     let recordedExitCode = 0;
     const pool = this;
-    const isPooled = this.allWorkers.has(worker);
     /** Buffer OUTPUT_DATA until the caller registers onData (stdout can beat ReadableStream wiring). */
     const pendingData: Buffer[] = [];
     let userDataCb: ((chunk: Buffer) => void) | null = null;
@@ -322,15 +323,7 @@ export class BridgePool {
       const cbNow = closeCb;
       closeCb = null;
       cbNow?.(code);
-      if (isPooled) {
-        pool.release(worker);
-      } else {
-        // Ephemeral overflow worker (pool was saturated at acquire time): it is
-        // not tracked by the pool and will never be reused, so shut it down
-        // instead of leaking the child process.
-        workerSendShutdown(worker);
-        workerKill(worker);
-      }
+      pool.release(worker);
     };
 
     // Handle unexpected process death
@@ -341,11 +334,7 @@ export class BridgePool {
       const cbNow = closeCb;
       closeCb = null;
       cbNow?.(1);
-      if (isPooled) {
-        pool.remove(worker);
-      } else {
-        workerKill(worker);
-      }
+      pool.remove(worker);
     };
 
     return {
@@ -362,11 +351,11 @@ export class BridgePool {
       kill() {
         if (done) return;
         done = true;
-        if (isPooled) {
-          pool.remove(worker);
-        } else {
-          workerKill(worker);
-        }
+        recordedExitCode = 1;
+        const cbNow = closeCb;
+        closeCb = null;
+        cbNow?.(1);
+        pool.remove(worker);
       },
       onData(cb: (chunk: Buffer) => void) {
         const flushed = pendingData.splice(0, pendingData.length);

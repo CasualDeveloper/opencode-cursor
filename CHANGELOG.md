@@ -5,6 +5,54 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Replace the localhost OpenAI/SSE proxy path with a native OpenCode
+  `LanguageModelV3` adapter
+- Start each user turn from OpenCode's active transcript and keep its Cursor
+  AgentService Run only while OpenCode resolves requested tools
+- Keep private Composer model routing, image input, cancellation, parallel tool
+  calls, live catalog discovery, OAuth refresh, and HTTP/2 worker pooling
+- Resume a live Run only for its exact trailing tool-result batch; steering,
+  compaction, regeneration, and incomplete parallel batches start a fresh Run
+- Add phase-aware native stall timeouts, bounded Run admission, parked-Run
+  eviction, and fail-fast HTTP/2 pool capacity
+- Preserve OpenCode tool failures when returning MCP results to Cursor
+- Estimate prompt usage from OpenCode's canonical transcript and tool results
+  whenever Cursor omits checkpoint token details
+
+### Removed
+
+- The localhost OpenAI/SSE proxy, cross-turn Cursor checkpoints, conversation
+  mutexes, session-routing headers, and their legacy smoke harness
+
+## [3.0.0-beta.1] - 2026-08-19
+
+### Changed
+
+- **Breaking:** replace the OpenCode 1 hook adapter with a V2-only
+  `Plugin.define` entrypoint
+- Move Cursor OAuth and refresh into OpenCode V2 integration APIs
+- Publish the live Cursor provider, models, capabilities, prices, and variants
+  through V2 catalog transforms
+- Route exact Cursor model selections through per-model and per-variant headers
+- Pin the OpenCode CLI, plugin, and schema packages to one matching beta build
+
+### Removed
+
+- OpenCode 1 `config`, `provider.models`, `auth.loader`, `chat.headers`, and
+  `chat.params` hooks
+- Direct reads and writes of OpenCode's credential store
+- Logged-out placeholder models and V1 static-provider compatibility shims
+
+### Preserved
+
+- Cursor private models and AgentService
+- Stateful checkpoints and tool-result continuation
+- Image input, streaming, cancellation, stall recovery, and HTTP/2 pooling
+
 ## [2.2.0] - 2026-08-05
 
 ### Changed

@@ -1,7 +1,7 @@
 {
   "name": "@otto-assistant/opencode-cursor-oauth",
-  "version": "2.2.0",
-  "description": "Cursor models in OpenCode — native OAuth, live catalog discovery, agent-grade streaming. Direct API, no cursor-agent binary.",
+  "version": "3.0.0-beta.1",
+  "description": "Cursor private models in OpenCode 2 — native OAuth, live catalog discovery, images, tools, and agent-grade streaming.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,8 +18,12 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
-    "test": "bun test/smoke.ts",
+    "build": "node scripts/clean.mjs && tsc -p tsconfig.json && node scripts/copy-runtime.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "bun test test/*.test.ts",
+    "test:package": "node scripts/check-package.mjs",
+    "test:v2-loader": "node scripts/smoke-opencode-v2.mjs",
+    "verify": "npm test && npm run typecheck && npm run build && npm run test:package && npm run test:v2-loader",
     "prepublishOnly": "npm run build"
   },
   "repository": {
@@ -36,7 +40,6 @@
     "cursor",
     "cursor-pro",
     "oauth",
-    "openai-compatible",
     "ai",
     "llm",
     "streaming",
@@ -49,11 +52,17 @@
     "access": "public"
   },
   "dependencies": {
+    "@ai-sdk/provider": "3.0.8",
     "@bufbuild/protobuf": "^2.0.0",
-    "@opencode-ai/plugin": "^1.15.7"
+    "@opencode-ai/plugin": "0.0.0-beta-17639",
+    "@opencode-ai/schema": "0.0.0-beta-17639"
   },
   "devDependencies": {
+    "@opencode-ai/cli": "0.0.0-beta-17639",
     "@types/bun": "^1.3.11",
     "typescript": "^5.9.3"
-  }
+  },
+  "trustedDependencies": [
+    "@opencode-ai/cli"
+  ]
 }
