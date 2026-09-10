@@ -85,9 +85,10 @@ export function createCursorRuntime(
       const getAccessToken =
         services.createAccessTokenProvider(context);
       services.startTransport();
-      cleanups.push(() => services.stopTransport());
+      const scope = crypto.randomUUID();
+      cleanups.push(() => services.stopTransport(scope));
       const languageRegistration =
-        await services.registerLanguage(context, getAccessToken);
+        await services.registerLanguage(context, getAccessToken, scope);
       cleanups.push(() => languageRegistration.dispose());
       const discoverModels = async (
         fallback: CursorCatalogState["models"],
